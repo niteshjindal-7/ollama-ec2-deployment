@@ -1,0 +1,59 @@
+import os
+
+# List of files to be created
+files = [
+    ".gitignore",
+    "Dockerfile",
+    "README.md",
+    "app.py",
+    "docker-compose.yml",
+    "main.py",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.sh",
+]
+
+for file in files:
+
+    with open(file, "w") as f:
+
+        # Populate pyproject.toml with default content
+        if file == "pyproject.toml":
+
+            f.write("""# =============================================================================
+# What is a TOML file?
+#
+# TOML stands for "Tom's Obvious, Minimal Language".
+#
+# It is a configuration file used by modern Python projects to store
+# project-related information in a clean and readable format.
+#
+# Why do we need it?
+#
+# Instead of keeping project metadata, dependencies, Python version,
+# package name, etc. in different places, we keep everything together
+# inside pyproject.toml.
+#
+# Most modern Python tools (such as uv, Poetry, Hatch and PDM) automatically
+# read this file to understand how the project should be built and what
+# dependencies need to be installed.
+#
+# Think of this file as the "identity card" of your Python project.
+# =============================================================================
+
+[project]
+name = "ollama-aws-deployment"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi==0.115.5",
+    "httpx==0.27.2",
+    "pydantic==2.10.3",
+    "uvicorn[standard]==0.32.1",
+]
+""")
+
+    print(f"Created: {file}")
