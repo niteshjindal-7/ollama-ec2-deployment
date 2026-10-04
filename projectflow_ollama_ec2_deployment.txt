@@ -1,0 +1,673 @@
+================================================================================
+PROJECT FLOW: OLLAMA + FASTAPI DEPLOYMENT ON EC2 — COMPLETE RUNBOOK
+================================================================================
+Goal: self-host the Ollama server (an LLM runtime/engine) running the
+qwen2.5:0.5b model (a specific set of downloaded model weights), alongside
+a FastAPI wrapper, on an AWS EC2 instance, using Docker Compose.
+
+Key distinction carried through this whole project:
+  - Ollama = the server/runtime software that loads and serves LLM models
+  - qwen2.5:0.5b = a specific LLM model (weights) that runs inside Ollama
+  - "Pulling the Ollama image" (from Docker Hub) and "pulling a model"
+    (from Ollama's own registry) are two completely different actions,
+    hitting two different remote services. Confusing these two is the
+    most common mistake when reasoning about this stack.
+
+Why EC2 at all: local deployment on a Mac was blocked by a corporate
+Zscaler network policy that blocks the "Generative AI and ML Applications"
+category of domains, including registry.ollama.ai (confirmed via direct
+curl tests showing Zscaler's own block page). Gemini API calls worked
+fine locally because generativelanguage.googleapis.com isn't in that
+blocked category — Gemini is API-only anyway (no model weights to
+download at all; Anthropic/OpenAI/Google never publish their frontier
+model weights publicly, unlike Llama/Qwen/Gemma, which is WHY a tool
+like Ollama can exist for those at all). A throwaway EC2 test instance
+proved registry.ollama.ai IS reachable from EC2 (outside the corporate
+network), which is why the real deployment happens there.
+
+================================================================================
+SECTION 1: AWS ACCOUNT / IAM SETUP
+================================================================================
+
+CONCEPT — Root user vs IAM user:
+  - Root user = created automatically with the AWS account. Unlimited
+    power (billing, delete account, every service). Risky for daily work.
+  - IAM user = a separate login (same account) with DELIBERATELY LIMITED
+    permissions. Limits blast radius — a mistake or leaked credential on
+    a scoped-down user can't touch billing, S3, or delete the account.
+  - IAM Role (not used in this project) = permissions attached directly
+    to a resource (like an EC2 instance) so it can call OTHER AWS
+    services on its own behalf. Not needed here — this project's code
+    never calls any AWS service from inside the instance (confirmed by
+    reading setup.sh, docker-compose.yml, Dockerfile, app.py — the only
+    AWS-ish thing touched is the EC2 instance metadata endpoint,
+    169.254.169.254, which needs no IAM permission at all).
+
+WHAT THIS PROJECT ACTUALLY NEEDS FROM AWS (verified by reading every
+project file): only EC2 — launching/stopping/terminating instances, their
+security groups, and key pairs. Nothing else (no S3, no Lambda, no ECR).
+
+STEPS TAKEN:
+1. Logged in as root (one-time, to create the IAM user)
+2. IAM -> Users -> Create user
+   - Username: ollama-deployment
+   - Checked "Provide user access to the AWS Management Console"
+     (lets this user log in via browser; this is INDEPENDENT of and does
+     NOT block setting up CLI access keys later for the same user if ever
+     needed for a different tool like AWS CDK/Terraform)
+   - Permissions: "Attach policies directly" (not via a Group — Groups
+     exist to manage permissions across MANY users at once; overkill for
+     one user with one project-specific policy) -> attached
+     AmazonEC2FullAccess (AWS-managed policy)
+   - Did NOT use AdministratorAccess — that grants power over EVERY AWS
+     service (billing, IAM, S3, all of it); EC2FullAccess is scoped to
+     just the one service this project needs. Safer middle ground than
+     admin, without needing to hand-write a custom minimal policy.
+3. Saved the console password in a password manager (NOT in this file —
+   same reasoning as why the Gemini API key lives in .env, gitignored,
+   rather than hardcoded in app.py: credentials don't belong in a
+   plaintext file sitting in a git-tracked project folder).
+4. Logged out of root, logged back in at the account's IAM sign-in URL
+   as ollama-deployment for all subsequent AWS console work.
+
+CONCEPT — policy vs permission:
+  - Permission = one atomic rule: "this identity can do this action on
+    this resource" (e.g. "can launch EC2 instances").
+  - Policy = a JSON document bundling MANY permissions together, so you
+    attach one document instead of granting permissions one at a time.
+  - AmazonEC2FullAccess's policy is roughly:
+      { "Effect": "Allow", "Action": "ec2:*", "Resource": "*" }
+    "ec2:*" = every action starting with ec2: (RunInstances,
+    TerminateInstances, CreateSecurityGroup, AuthorizeSecurityGroupIngress,
+    etc. — dozens of permissions bundled under one wildcard). Contrast
+    with AdministratorAccess: "Action": "*" on "Resource": "*" — literally
+    every action, every service, account-wide.
+
+IMPORTANT — AMI vs EC2 instance (came up mid-project, worth stating here):
+  - AMI (Amazon Machine Image) = a frozen, reusable TEMPLATE (OS + any
+    pre-installed software). Sits in AWS's catalog, not running, just a
+    blueprint. Many separate instances can be launched from the same AMI.
+  - EC2 instance = the actual, live, running (or stopped) virtual machine
+    CREATED FROM an AMI, with its own CPU/RAM, its own IPs, its own
+    mutable disk. Installing Docker on your instance changes only your
+    instance's disk — the original AMI in AWS's catalog is untouched.
+  - Analogy: AMI = a .dmg installer. EC2 instance = the actual running,
+    customized copy of the app after installing it.
+
+================================================================================
+SECTION 2: EC2 INSTANCE CREATED
+================================================================================
+- Name: ollama-deployment-wn
+- Region: Asia Pacific (Mumbai) ap-south-1 — chosen for lower cost/latency.
+  IMPORTANT: each AWS region is an isolated, separate environment — an
+  instance created in ap-south-1 is invisible if you switch the region
+  dropdown to e.g. us-east-1. They don't share instances, security
+  groups, key pairs, or VPCs.
+- AMI: Ubuntu (Canonical, 26.04) — chosen deliberately over Amazon Linux
+  for consistency with earlier testing; Ubuntu uses apt, Amazon Linux
+  uses dnf (setup.sh supports both via its detect_os() function).
+- Instance type: t2.medium (2 vCPU, 4 GiB RAM) — NOT t2.micro/free tier
+  (1 GiB RAM). A prior throwaway test used t2.micro and that's fine for
+  a pure connectivity test, but genuinely running even a small LLM plus
+  Docker overhead needs more headroom.
+- Key pair: created new, "ollama-qwen-key", .pem format, downloaded.
+  (Never reuse a key pair from an unrelated project — keeps credentials
+  cleanly separated per project.)
+- Storage: 8 GiB gp3 at launch — LATER HAD TO BE INCREASED to 20 GiB
+  (see Section 6, disk space ran out mid-deployment). If redoing this,
+  consider starting with 20 GiB directly to skip that detour.
+- Auto-assign public IP: Enabled (required — without a public IP,
+  neither SSH from the Mac nor external curl requests could ever reach
+  the instance at all, regardless of Security Group rules).
+- Advanced details: left everything else at default (IAM instance
+  profile, tenancy, spot instances, etc. all irrelevant to this project).
+
+================================================================================
+SECTION 3: SECURITY GROUP (ollama-qwen-sg) — TWO RULES
+================================================================================
+A Security Group is a virtual firewall. By default it denies ALL inbound
+traffic — every port sealed — until you add explicit "allow" rules.
+
+RULE 1 — SSH
+  Type: ssh | Protocol: TCP | Port: 22 | Source: Anywhere-IPv4 (0.0.0.0/0)
+  Purpose: lets us open a remote terminal session on the EC2 instance
+  from the Mac, to run commands there directly (install Docker, docker
+  compose, check logs, etc). SSH only controls WHO can log in to a shell
+  — it's for US (the administrator), separate from port 8000 below which
+  is for actual API clients.
+
+  Why "Anywhere" and not "My IP" (tried My IP first):
+  - Our network's public IP rotates constantly — this is a corporate
+    Zscaler proxy routing through a POOL of exit IPs, not one fixed
+    address. Confirmed by running `curl https://icanhazip.com` repeatedly
+    and getting 5+ different results across one work session, each
+    change silently breaking the "My IP"-restricted rule (SSH just hangs
+    with a connection timeout — no helpful error — when the Security
+    Group blocks the source IP).
+  - Settled on Anywhere-IPv4 since chasing a constantly-changing IP
+    wasn't practical. The .pem private key is still required to actually
+    authenticate and log in — opening the PORT to any source doesn't
+    mean anyone can get in without the key. Reasonable trade-off for a
+    learning/test instance; would use a fixed IP or a VPN with a stable
+    exit IP for real production use.
+
+  SEPARATE ISSUE — the EC2 instance's OWN public IP also changes, but
+  only when the INSTANCE ITSELF is stopped and restarted (not related to
+  Security Group rules at all, and not something that happens on every
+  SSH attempt). If SSH fails with a timeout even after confirming the
+  Security Group looks right, re-check the instance's CURRENT Public
+  IPv4 address in the EC2 console before assuming it's a Security Group
+  problem — these are two independent, easily-confused failure modes.
+
+RULE 2 — Custom TCP
+  Type: Custom TCP | Protocol: TCP | Port: 8000 | Source: Anywhere (0.0.0.0/0)
+  Purpose: opens the EC2 HOST's port 8000 so external clients (the Mac's
+  curl, or any other user) can reach the FastAPI app. This host port maps
+  (via docker-compose.yml's "8000:8000") to the api container's internal
+  port 8000, where uvicorn listens across all its own container-internal
+  interfaces (--host 0.0.0.0 in the Dockerfile's CMD).
+  Source is "Anywhere" deliberately here (unlike SSH) — this is meant to
+  be a public-facing API endpoint.
+
+  NOTE: port 11434 (Ollama's own port) was deliberately NEVER opened in
+  the Security Group. No external internet client can reach it — it's
+  only used internally, container-to-container, via Docker's own
+  internal DNS (http://ollama:11434), which never touches the public
+  internet or the Security Group at all. The "11434:11434" host-level
+  mapping in docker-compose.yml would only matter if you wanted to
+  directly curl the Ollama port from the Mac for debugging — which is
+  currently blocked by the Security Group as-is.
+
+CLEANUP NOTE: AWS's launch wizard sometimes leaves a stray leftover rule
+(port 0, source 0.0.0.0/0) from its own default template — not something
+we asked for. Checked and removed it via Edit inbound rules -> Remove on
+that specific row, leaving exactly the 2 intended rules.
+
+================================================================================
+SECTION 4: CONNECTING TO THE INSTANCE (SSH + SCP)
+================================================================================
+
+CONCEPT — ssh vs scp (two different tools, same underlying key/connection):
+  - ssh = opens an INTERACTIVE remote terminal session. Type commands,
+    see output, back-and-forth. Every command typed after connecting runs
+    ON THE EC2 INSTANCE, not on the Mac — the Mac's terminal is just the
+    window into it.
+  - scp (Secure Copy) = a ONE-SHOT file/folder transfer. No interactive
+    session — copies, then exits. Run from the Mac's own terminal, NOT
+    from inside an active ssh session.
+
+COMMAND 1 (run on the Mac, once per downloaded key file):
+  chmod 400 ollama-qwen-key.pem
+  - Restricts the key file so ONLY its owner can read it — nobody can
+    write or execute it, no other user on the Mac can read it at all.
+  - SSH requires this before it will even attempt to use the key; it
+    refuses a key file that's "too open" as a security check, regardless
+    of whether the key itself is valid. This is a ONE-TIME, PERMANENT
+    change to the file on disk — never needs re-running unless the file
+    is re-downloaded fresh (which would reset its permissions).
+
+COMMAND 2 — connect:
+  ssh -i ollama-qwen-key.pem ubuntu@<ec2-current-public-ip>
+  - -i ollama-qwen-key.pem: proves identity using the PRIVATE key in this
+    file. The EC2 instance already holds the matching PUBLIC key
+    (installed automatically because this exact key pair was selected at
+    launch) — SSH uses the two together to cryptographically confirm
+    it's really us, no password ever sent over the network.
+  - ubuntu@: the username to log in as (Ubuntu AMI's default account).
+  - <ec2-current-public-ip>: ALWAYS double check this in the EC2 console
+    before connecting — it changes if the instance was stopped/restarted.
+
+COMMAND 3 — transfer the project folder (run on the Mac, NOT inside an
+active ssh session):
+  scp -i ollama-qwen-key.pem -r \
+    /Users/njindal/Desktop/Study/Projects/GenAI_and_Agents/project_m6_ollama_server_deployment \
+    ubuntu@<ec2-current-public-ip>:/home/ubuntu/
+  - -i: same private key as ssh. -r: "recursive", required because we're
+    copying an entire FOLDER (with subfolders), not a single file.
+  - Destination lands at /home/ubuntu/project_m6_ollama_server_deployment
+    on the instance (NOT /opt/ollama-chatbot — that path is specific to
+    setup.sh's own copy_project() function, which we are NOT using since
+    we chose the manual approach; no need to replicate that path).
+  - scp -r copies EVERYTHING in the folder including hidden files — this
+    sweeps up .git/ (created by git init on this project earlier), which
+    is why the transfer output includes lots of unfamiliar names like
+    HEAD, index, COMMIT_EDITMSG, and *.sample files (pre-commit.sample,
+    pre-push.sample, etc.) — these are just Git's own internal
+    bookkeeping and default disabled hook templates, harmless, not
+    anything we wrote, and not needed by the EC2 instance at all (Git has
+    zero role on the instance itself — it's a version-control tool for
+    pushing code to a remote repo, irrelevant to actually running the app).
+
+VERIFICATION after transfer (on the instance, via ssh):
+  ls -a ~/project_m6_ollama_server_deployment
+  cat ~/project_m6_ollama_server_deployment/.env
+  -> confirm app.py, docker-compose.yml, Dockerfile, requirements.txt,
+     setup.sh all present, and .env contains GEMINI_API_KEY, GEMINI_MODEL,
+     OLLAMA_MODEL=qwen2.5:0.5b correctly.
+
+================================================================================
+SECTION 5: DECISION — MANUAL STEPS INSTEAD OF RUNNING setup.sh DIRECTLY
+================================================================================
+setup.sh automates everything from here (install Docker, copy files,
+patch the port, bring up the stack, pull a model, print a summary) into
+one command: sudo ./setup.sh --model qwen2.5:0.5b
+
+DECIDED instead to run the EQUIVALENT steps MANUALLY, one at a time,
+validating each before moving to the next — this is a first-ever EC2
+deployment, and the goal is deep understanding of each component, not
+just a working result. setup.sh remains a completely correct reference
+for the right command order (it's not doing anything we couldn't type by
+hand — every line is an ordinary shell command bundled for repeatability/
+consistency across machines/OSes). Once comfortable with every step,
+setup.sh can be used directly on future/fresh instances to save time.
+
+================================================================================
+SECTION 6: INSTALL DOCKER ON THE EC2 INSTANCE
+(manual version of setup.sh's install_docker() function)
+================================================================================
+All commands run directly inside the ssh session, in this exact order.
+
+1. sudo apt-get update
+   - Refreshes Ubuntu's local index of available packages/versions from
+     its configured repositories. Installs nothing itself.
+
+2. sudo apt-get install -y ca-certificates curl gnupg lsb-release
+   - ca-certificates = bundle of trusted Certificate Authority (CA)
+     certs, used to verify any site's SSL certificate is genuine
+     (protects the download "pipe"). An SSL certificate is one site's own
+     identity document (e.g. download.docker.com's); a CA certificate
+     belongs to the authority that signed it (e.g. Google Trust Services,
+     DigiCert) — ca-certificates is the trusted reference list used to
+     check a site's SSL cert against. Without it, there's nothing to
+     verify an incoming certificate against at all.
+   - curl = command-line tool to download files over HTTP/HTTPS.
+   - gnupg = provides `gpg`, used to verify Docker's package-signing key
+     — a SEPARATE trust layer from SSL/ca-certificates. ca-certificates/
+     SSL protects the download PIPE (are we really talking to Docker's
+     real server); the GPG signature protects the package CONTENTS
+     itself (is this genuinely Docker's software, unaltered) —
+     independently of how it was transmitted. A signing key is a
+     cryptographic credential: Docker signs every package with a private
+     key only they hold; we get their PUBLIC key to verify those
+     signatures, the same concept as a handwritten signature but
+     mathematically unforgeable.
+   - lsb-release = lets scripts detect the exact Ubuntu codename (used
+     in step 6 below).
+   - On this AMI, all 4 were already pre-installed — apt just confirmed
+     "already the newest version" and did nothing further. Harmless to
+     run regardless.
+
+3. sudo install -m 0755 -d /etc/apt/keyrings
+   - Creates a system folder (absolute path starting with /, nothing to
+     do with the home directory — ls -a in ~ will never show this) to
+     store trusted package-signing keys.
+
+4. curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+     sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+   - Downloads Docker's official public signing key and converts it from
+     human-readable "ASCII-armored" text format into the binary format
+     apt requires. `gpg --dearmor` is that conversion, done in the same
+     pipeline as the download (curl fetches the raw text key, pipes it
+     straight into gpg which converts and saves it in one step).
+
+5. sudo chmod a+r /etc/apt/keyrings/docker.gpg
+   - Makes the key file readable so apt can actually use it.
+
+   VERIFICATION after steps 3-5 — don't just trust "no error", confirm
+   the file is genuinely correct:
+   - ls -la /etc/apt/keyrings/docker.gpg -> real file, non-zero size
+   - file /etc/apt/keyrings/docker.gpg -> should report something like
+     "OpenPGP Public Key Version 4 ... RSA ... 4096 bits"
+   - The `file` command inspects a file's ACTUAL content/structure
+     (every file format has a distinctive byte signature at its start),
+     not just its filename/extension — this catches the case where a
+     download silently failed and something else (e.g. an HTML error
+     page) got saved under the expected filename.
+
+6. echo "deb [arch=$(dpkg --print-architecture) \
+       signed-by=/etc/apt/keyrings/docker.gpg] \
+       https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+       | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+   - "Registering a repository" = telling apt about an ADDITIONAL
+     software source beyond Ubuntu's own defaults (which don't carry
+     Docker's official builds at all). This command just writes ONE LINE
+     into a new config file — apt reads every file inside
+     /etc/apt/sources.list.d/ as an extra source list. Nothing is
+     downloaded or installed yet at this point.
+   - echo just generates the line of text; `sudo tee ... > /dev/null`
+     is what actually WRITES it into the protected /etc/ file (needed
+     because echo itself isn't run as sudo, and a plain `>` redirect
+     can't write to a root-owned path either).
+   - Breaking down the line itself: `deb` = "this is a binary package
+     source" (standard format keyword). `arch=amd64` = only use packages
+     built for this CPU architecture. `signed-by=...docker.gpg` = only
+     trust packages from this source if signed by the key verified in
+     step 4/5 — this is the direct link back to the trust chain just
+     built. The URL = where Docker's packages actually live. The
+     codename (e.g. "resolute") = which Ubuntu version's packages to use.
+     "stable" = which release channel.
+   - VERIFIED with: cat /etc/apt/sources.list.d/docker.list
+   - RISK FLAGGED (didn't cause a problem here, but worth knowing): the
+     AMI's Ubuntu codename was "resolute" — a brand-new release. New
+     codenames can sometimes outpace Docker's own repository support,
+     causing a 404 on the next apt update. Worked fine in this case.
+
+7. sudo apt-get update  (again)
+   - Critical — this second refresh is what makes apt actually READ the
+     newly-registered Docker repository from step 6. Confirmed fetching
+     from download.docker.com with no 404 errors.
+
+8. sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
+     docker-compose-plugin
+   - THE actual Docker installation (everything before this was
+     preparation). Installed 7 packages total (the 4 named plus
+     auto-pulled dependencies docker-buildx-plugin, docker-ce-rootless-
+     extras, pigz). ~101 MB downloaded.
+
+9. docker --version
+   -> Docker version 29.8.2
+
+10. sudo systemctl status docker
+    -> Active: active (running)
+
+11. sudo systemctl enable --now docker
+    - Ensures Docker also auto-starts on any future reboot, not just
+      currently running in this session.
+
+STEP COMPLETE — Docker installed, running, and enabled on the instance.
+
+================================================================================
+SECTION 7: BRING UP THE DOCKER COMPOSE STACK
+(manual version of setup.sh's start_stack() function)
+================================================================================
+
+1. cd ~/project_m6_ollama_server_deployment
+
+2. OLLAMA_MODEL environment variable — the manual `export
+   OLLAMA_MODEL=qwen2.5:0.5b` step from setup.sh was SKIPPED. Docker
+   Compose automatically looks for a file literally named .env sitting
+   next to docker-compose.yml and uses it to fill in any ${VARIABLE}
+   references in the YAML — this happens automatically, earlier than,
+   and independently of anything app.py's own python-dotenv/load_dotenv()
+   does. Since .env already had OLLAMA_MODEL=qwen2.5:0.5b (matching the
+   docker-compose.yml default anyway: ${OLLAMA_MODEL:-qwen2.5:0.5b}),
+   this was safe either way. Verify empirically rather than assume:
+     sudo docker exec ollama-api env | grep OLLAMA_MODEL
+
+3. sudo docker compose up -d --build
+   - Builds the api image from the Dockerfile (python:3.12-slim base,
+     installs requirements.txt, copies app.py), pulls ollama/ollama:latest
+     from Docker Hub, creates a private Docker network + the ollama_data
+     volume, starts both containers.
+   - IMPORTANT: this command must run with sudo and from INSIDE the ssh
+     session (on the EC2 instance) — running it on the Mac by mistake
+     (easy to do if you forget which terminal tab is which) will either
+     fail entirely (no docker-compose.yml context there matching EC2) or
+     try to run things locally on the Mac instead, which is not the goal.
+   - Does "sudo docker compose up" count as "deployment"? Yes, in the
+     broad/common sense — it takes code and makes it actually run,
+     serving real traffic, on a real internet-reachable machine (not
+     just sitting as files). It's the simplest legitimate form of
+     deployment: a single, direct instance bring-up. More advanced
+     "deployment" in bigger production systems can also imply zero-
+     downtime rolling updates, automated rollback, health-check-gated
+     traffic shifting, multi-instance load balancing, and CI/CD pipeline
+     integration (auto-triggering this same kind of process the moment
+     code is pushed to GitHub, instead of a human manually running it) —
+     none of which this simple command does, but none of which is needed
+     for this learning project either.
+
+   >>> ISSUE HIT — ran out of DISK SPACE mid-pull (not RAM) <<<
+   First attempt failed partway through pulling ollama/ollama:latest:
+     "no space left on device" (writing to containerd's content store)
+   - Root cause: `df -h /` showed the 8 GiB root volume only had 3.4G
+     free — not enough for the 3.78GB image. `sudo docker system df`
+     confirmed the partial pull left nothing behind (clean failure,
+     0 images/containers, nothing to clean up).
+   - Disk space vs RAM, precisely: disk space = permanent file storage,
+     where Docker images/containers are physically written as files on
+     the attached EBS volume. RAM = memory for currently-running
+     processes' temporary working data — a completely different,
+     separate resource. "no space left on device" referencing a file
+     WRITE is specifically a disk-capacity error. A genuine RAM problem
+     looks different: "Cannot allocate memory", or the Linux OOM-killer
+     silently killing a process, or general system sluggishness under
+     load — not what was seen here.
+
+   FIX — two SEPARATE steps required (resizing the volume alone is NOT
+   enough):
+   (a) AWS Console -> EC2 -> Elastic Block Store -> Volumes -> select the
+       volume attached to this instance -> Actions -> Modify volume ->
+       Size 8 -> 20 GiB -> Modify -> confirmed.
+       WHY a second step is still needed: resizing the EBS volume only
+       grows the underlying raw virtual disk — like making a shipping
+       container physically bigger. The FILESYSTEM is the "shelving
+       system" installed inside it that actually tracks what space is
+       usable; it does not auto-discover the new room on its own. This
+       two-step process (resize raw storage, then explicitly extend the
+       filesystem) is a deliberate safety design used across all cloud
+       providers — auto-resizing a live, mounted filesystem under a
+       running OS is riskier than doing it as two controlled, explicit
+       actions.
+   (b) On the instance:
+       lsblk
+       - Showed disk xvda already at 20G (AWS's resize applied at the
+         raw-disk level) but partition xvda1 (the root partition) still
+         only 6.9G — this gap is exactly what needed closing.
+
+       sudo growpart /dev/xvda 1
+       - Grows partition 1 on disk xvda to use the newly available space
+         on the disk itself. (Output confirmed: partition size grew from
+         14452703 to 39618527 blocks.)
+
+       sudo resize2fs /dev/xvda1
+       - Extends the actual filesystem (ext4, Ubuntu's default) to use
+         the newly-grown partition. (If the filesystem were xfs instead,
+         the equivalent command would be `xfs_growfs /`.)
+
+       df -h /
+       -> confirmed 19G total, 16G available (up from 6.7G/3.4G). Fixed.
+
+   RETRY: sudo docker compose up -d --build — succeeded cleanly this
+   time. Pulled ollama/ollama:latest (~101s), built the api image
+   (~21s), created the network + ollama_data volume, started both
+   containers.
+
+4. Verify: sudo docker ps
+   Expected two rows:
+     ollama-api  -> Up, ports 0.0.0.0:8000->8000/tcp
+     ollama      -> Up (healthy), ports 0.0.0.0:11434->11434/tcp
+   ("healthy" appears for ollama specifically because of the healthcheck
+   block defined in docker-compose.yml for that service; ollama-api has
+   no healthcheck defined in this project, so it just shows plain "Up".)
+
+   Also check logs if anything looks off:
+     sudo docker logs ollama
+     sudo docker logs ollama-api
+
+   CONTAINER LIFECYCLE NOTE (useful for later): stopping a container
+   (docker stop) does NOT delete it — it just goes from "Running" to
+   "Exited", still exists, still restartable (docker start) with its
+   state intact. Only an explicit removal (docker rm, or docker compose
+   down) actually deletes a container. Even then, anything stored in a
+   named VOLUME (like ollama_data, holding the downloaded model) survives
+   — only explicitly removing the volume itself (docker volume rm) would
+   lose that.
+
+STEP COMPLETE — both containers running on the EC2 instance.
+
+================================================================================
+SECTION 8: PULL THE MODEL
+(manual version of setup.sh's pull_model() function)
+================================================================================
+IMPORTANT DISTINCTION: bringing up the stack (Section 7) does NOT pull
+any model. The ollama container, once running, is a completely EMPTY
+engine. Pulling a model into it is a separate, subsequent action, hitting
+a different remote service entirely (registry.ollama.ai, Ollama's own
+model registry — nothing to do with Docker Hub, which only hosted the
+empty Ollama SERVER image).
+
+Deliberately tested /generate BEFORE pulling the model, to see the real
+failure mode rather than just assume it (run from anywhere with network
+access to the instance's public IP, e.g. the Mac or even from inside the
+ssh session itself):
+  curl -X POST "http://<ec2-public-ip>:8000/generate" \
+    -H "Content-Type: application/json" -d '{"prompt": "Hello"}'
+  -> {"error":"model 'qwen2.5:0.5b' not found"}
+
+This confirms precisely: containers running + the request correctly
+reaching Ollama is NOT the same as the model existing. FastAPI's own
+validation passed fine (a prompt WAS provided, satisfying app.py's
+PromptRequest model, which requires a prompt field with no default) — it
+proceeded all the way to Ollama, which then reported the model is simply
+not present yet.
+
+Now actually pull the model (on the instance, inside the ssh session):
+  sudo docker exec ollama ollama pull qwen2.5:0.5b
+  -> downloaded 397MB, "verifying sha256 digest", "writing manifest",
+     "success". NO Zscaler block, no certificate error — this is the
+     direct, empirical confirmation that EC2 is genuinely outside the
+     corporate network restriction hit repeatedly earlier on the Mac/
+     work laptop (both natively and inside a local Docker container).
+
+Verify: sudo docker exec ollama ollama list
+  -> qwen2.5:0.5b   397 MB   present
+
+NOTE on `docker exec`: this means "run a command inside an ALREADY-
+RUNNING container" — it does not start, restart, or re-initialize
+anything. The ollama container must already be up (confirmed via
+docker ps) before this works at all.
+
+STEP COMPLETE.
+
+================================================================================
+SECTION 9: TEST END-TO-END
+================================================================================
+Re-ran the EXACT SAME curl command from Section 8's "before" test:
+  curl -X POST "http://<ec2-public-ip>:8000/generate" \
+    -H "Content-Type: application/json" -d '{"prompt": "Hello"}'
+  -> {"model":"qwen2.5:0.5b","created_at":"...",
+      "response":"Hello! How can I assist you today?","done":true,...}
+
+Real, generated response. Full request chain confirmed working:
+  client curl
+    -> EC2 public IP : 8000 (Security Group Rule 2 allows this)
+    -> uvicorn (listening --host 0.0.0.0 --port 8000 inside the api
+       container, per the Dockerfile's CMD)
+    -> FastAPI routes to the /generate function in app.py
+    -> app.py builds a payload {"model": "qwen2.5:0.5b", "prompt": ...}
+       and sends it to OLLAMA_BASE_URL (set via docker-compose.yml's
+       environment block to http://ollama:11434 — Docker's own internal
+       DNS hostname, resolved only within the private network Compose
+       created for these two containers; this never touches the public
+       internet, the EC2 host's real network interface, or the Security
+       Group at all)
+    -> ollama container receives it on its internal port 11434, runs
+       qwen2.5:0.5b inference
+    -> response flows back the exact same path in reverse
+
+WHY uvicorn specifically (refresher, since this came up again mid-
+project): FastAPI is just a Python framework defining WHAT to do with a
+request (the route functions) — it has no ability on its own to open a
+network port or handle raw HTTP bytes. Uvicorn is the actual running
+server process that opens port 8000, listens for real connections,
+parses raw HTTP into something FastAPI can use, and calls the matching
+Python function. Without uvicorn, app.py's code is just inert, unreachable
+Python — never actually serving anything.
+
+STEP COMPLETE — FULL DEPLOYMENT WORKING END TO END ON EC2.
+
+================================================================================
+SECTION 10: ONGOING / FOR NEXT TIME
+================================================================================
+- Current public IP: check the EC2 console each session — it changes
+  whenever the instance is stopped and restarted (not on every SSH
+  attempt, only on an actual instance stop/start cycle).
+- If SSH suddenly times out: first run `curl https://icanhazip.com` on
+  the Mac to see if the exit IP changed (only relevant if the SSH rule
+  is ever switched back to "My IP" instead of Anywhere) — but also
+  independently re-check the instance's current public IP in the
+  console, since that's a second, unrelated possible cause of the same
+  symptom.
+- To stop incurring any further changes/charges from experimentation,
+  the instance can be stopped via the console; Docker, the containers,
+  and the pulled model all persist on the attached disk and resume
+  correctly on next start (only the public IP will likely change).
+- Not yet done / possible next steps if continuing this project further:
+  - Try CI/CD (e.g. GitHub Actions) to auto-deploy on every git push,
+    instead of manually running these commands each time.
+  - Try EC2 "User Data" (a script pasted into the launch config that
+    AWS runs automatically on first boot) as a middle ground between
+    full manual control and full CI/CD — would let setup.sh run
+    automatically without ever needing to SSH in and invoke it by hand.
+  - Add the ubuntu user to the docker group to avoid typing sudo before
+    every docker command.
+  - Tighten the SSH Security Group rule back to a specific IP (or a VPN
+    with a stable exit IP) if this were ever used beyond a personal
+    learning instance.
+
+================================================================================
+GLOSSARY — key terms encountered in this deployment
+================================================================================
+AMI (Amazon Machine Image): a frozen OS+software template used to create
+  EC2 instances from. Not the same as the instance itself.
+
+EC2 instance: the actual running/stopped virtual machine created from an
+  AMI; has its own mutable disk, IPs, and resource allocation.
+
+IAM user vs root: root has unlimited account-wide power; an IAM user has
+  only the permissions explicitly granted via an attached policy.
+
+Policy vs permission: a permission is one atomic rule; a policy bundles
+  many permissions into one attachable document.
+
+Security Group: a virtual firewall attached to an instance; denies all
+  inbound traffic by default except explicitly allowed rules (type,
+  port, source).
+
+Public IP vs private IP: public IP is reachable from the internet
+  (changes on instance stop/restart unless using a reserved Elastic IP);
+  private IP is only reachable from within the same AWS VPC.
+
+ssh vs scp: ssh opens an interactive remote terminal; scp does a one-shot
+  file/folder copy using the same key/connection mechanism.
+
+Docker image vs Docker container: an image is a reusable, static
+  blueprint (built or pulled); a container is a running (or stopped)
+  instance created FROM an image, with its own disposable writable layer
+  unless a volume is used.
+
+Docker volume: persistent storage that survives a container being
+  stopped, removed, or recreated — unlike the container's own writable
+  layer, which is lost on removal.
+
+Docker network (Compose-created): a private internal network connecting
+  containers defined in the same docker-compose.yml, enabling container-
+  to-container communication by SERVICE NAME (e.g. http://ollama:11434)
+  without ever touching the public internet or the host's real network
+  interface.
+
+CA certificate vs SSL certificate: an SSL certificate is one website's
+  own identity document; a CA certificate belongs to the trusted
+  authority that signed it. A system's ca-certificates bundle is the
+  trusted list used to verify any individual SSL certificate against.
+
+GPG signing key: a cryptographic key pair used to prove a package
+  genuinely came from its claimed publisher and wasn't tampered with —
+  separate and independent from SSL/CA trust, which only protects the
+  download channel, not the package contents themselves.
+
+uvicorn vs FastAPI: FastAPI defines what to do with a request (the
+  application logic); uvicorn is the actual server process that opens
+  the network port and handles raw HTTP traffic, calling FastAPI's code
+  per request. FastAPI alone cannot listen on a port or serve anything.
+
+docker exec: runs a command inside an ALREADY-RUNNING container — does
+  not start, create, or restart anything by itself.
+
+Disk space vs RAM: disk space is permanent file storage (where images/
+  containers/models are written as files); RAM is temporary working
+  memory for currently-running processes. Distinct resources with
+  distinct failure symptoms ("no space left on device" = disk;
+  "Cannot allocate memory" / OOM-killer = RAM).
+================================================================================
